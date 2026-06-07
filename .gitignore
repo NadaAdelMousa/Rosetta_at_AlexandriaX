@@ -216,3 +216,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Data files (never commit the actual dataset)
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.txt
+data/raw/
+data/processed/
+
+# Model weights (too large for GitHub)
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+
+# Experiment outputs
+mlruns/
+outputs/
+*.log
+
+
+# Environment
+.env
+__pycache__/
+*.pyc
+.DS_Store
