@@ -12,8 +12,16 @@ Pipeline
    pair each English turn with its dialectal reference.
 3. Flatten every conversation into one training pair per turn, where the
    prompt includes the conversation metadata (country/domain/participants/
-   speaker/direction) and the true dialectal history up to that turn.
-4. Wrap each pair into the {"messages": [system, user, assistant]} chat
+   speaker/direction) and the dialectal history up to that turn.
+4. For the train split only, optionally apply history noising as an
+   exposure-bias fix: each history turn's translation has a chance of being
+   corrupted (word drop/swap/duplicate), and the whole history has a chance
+   of being truncated to a shorter prefix. This simulates the imperfect
+   history the model will see at inference time (its own prior outputs)
+   instead of always training on clean gold history. The CLEAN reference
+   always propagates forward into the next turn's history — only the copy
+   shown in the prompt is corrupted. Dev is left clean for stable eval.
+5. Wrap each pair into the {"messages": [system, user, assistant]} chat
    schema and write alex_train.jsonl / alex_dev.jsonl.
 
 Output format (one JSON object per line):
@@ -40,12 +48,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from pathlib import Path
 
 from tqdm import tqdm
 
 DATASET_NAME = "UBC-NLP/alexandria"
 COUNTRIES = ["EG", "JO", "LB", "LY", "MA", "MR", "OM", "PS", "SA", "SD", "SY", "TN", "YE"]
+
+# ---- Exposure-bias fix: history noising (train split only) ----------------
+HISTORY_NOISE_P = 0.25       # P(a history translation gets corrupted during training)
+HISTORY_TRUNCATE_P = 0.15    # P(history randomly truncated to a shorter prefix)
+NOISE_SEED = 1234
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +177,70 @@ def system_prompt() -> str:
     )
 
 
-def create_finetuning_pairs(record: dict) -> list[dict]:
-    """Flatten a conversation into one (prompt, response) pair per turn,
-    using the true dialectal history (not model predictions) as context."""
+def corrupt_translation(text: str, rng: random.Random) -> str:
+    """Word-level corruption (drop/swap/duplicate) used to simulate an
+    imperfect translation history during training."""
+    words = text.split()
+    if len(words) < 3:
+        return text
+
+    mode = rng.choice(["drop", "swap", "duplicate"])
+    words = list(words)
+
+    if mode == "drop":
+        k = max(1, int(len(words) * rng.uniform(0.10, 0.25)))
+        for _ in range(k):
+            if len(words) > 2:
+                words.pop(rng.randrange(len(words)))
+    elif mode == "swap":
+        k = max(1, int(len(words) * rng.uniform(0.10, 0.20)))
+        for _ in range(k):
+            i = rng.randrange(len(words) - 1)
+            words[i], words[i + 1] = words[i + 1], words[i]
+    else:  # duplicate
+        i = rng.randrange(len(words))
+        words.insert(i, words[i])
+
+    return " ".join(words)
+
+
+def noise_history(
+    history: list[dict],
+    rng: random.Random,
+    noise_p: float = HISTORY_NOISE_P,
+    truncate_p: float = HISTORY_TRUNCATE_P,
+) -> list[dict]:
+    """Randomly truncate the history and/or corrupt individual turns'
+    translations, as shown in the prompt (does not mutate the input)."""
+    if not history:
+        return history
+
+    if rng.random() < truncate_p and len(history) > 1:
+        history = history[: rng.randrange(1, len(history) + 1)]
+
+    noised = []
+    for item in history:
+        translation = item["translation"]
+        if rng.random() < noise_p:
+            translation = corrupt_translation(translation, rng)
+        noised.append({**item, "translation": translation})
+    return noised
+
+
+def create_finetuning_pairs(
+    record: dict,
+    noise: bool = False,
+    rng: random.Random | None = None,
+    noise_p: float = HISTORY_NOISE_P,
+    truncate_p: float = HISTORY_TRUNCATE_P,
+) -> list[dict]:
+    """Flatten a conversation into one (prompt, response) pair per turn.
+
+    When `noise` is True, the history shown in the prompt is randomly
+    corrupted/truncated (exposure-bias fix) via `rng` — but the CLEAN
+    reference always propagates forward into the next turn's history, so
+    corruption never compounds across turns.
+    """
     pairs = []
     history: list[dict] = []
 
@@ -175,8 +250,9 @@ def create_finetuning_pairs(record: dict) -> list[dict]:
         if not sentence or not reference:
             continue
 
+        prompt_history = noise_history(history, rng, noise_p, truncate_p) if noise else history
         pairs.append({
-            "prompt": build_prompt(record, turn, history),
+            "prompt": build_prompt(record, turn, list(prompt_history)),
             "response": reference,
             "country": record.get("country", ""),
             "conv_id": record.get("conv_id", ""),
@@ -215,6 +291,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-name", default=DATASET_NAME, help="HF dataset to load.")
     parser.add_argument("--countries", nargs="+", default=COUNTRIES, help="Candidate country configs to check for a train split.")
     parser.add_argument("--hf-token", default=None, help="HF token (falls back to HF_TOKEN env var if set).")
+    parser.add_argument("--no-history-noise", action="store_true",
+                         help="Disable history noising on the train split (on by default).")
+    parser.add_argument("--history-noise-p", type=float, default=HISTORY_NOISE_P,
+                         help="P(a history translation gets corrupted) when noising is enabled.")
+    parser.add_argument("--history-truncate-p", type=float, default=HISTORY_TRUNCATE_P,
+                         help="P(history randomly truncated to a shorter prefix) when noising is enabled.")
+    parser.add_argument("--noise-seed", type=int, default=NOISE_SEED, help="Seed for the history-noising RNG.")
     return parser.parse_args()
 
 
@@ -234,11 +317,24 @@ def main() -> None:
     if missing:
         print("Countries without an HF train split (skipped):", missing)
 
+    noise_rng = random.Random(args.noise_seed)
+
     for split, out_name in [("train", "alex_train.jsonl"), ("dev", "alex_dev.jsonl")]:
         records = load_hf_records(args.dataset_name, train_countries, split)
-        pairs = [pair for record in records for pair in create_finetuning_pairs(record)]
+
+        # History noising (exposure-bias fix) is only applied to the train
+        # split; dev is kept on clean gold history for stable evaluation.
+        noise = split == "train" and not args.no_history_noise
+        pairs = [
+            pair
+            for record in records
+            for pair in create_finetuning_pairs(
+                record, noise=noise, rng=noise_rng,
+                noise_p=args.history_noise_p, truncate_p=args.history_truncate_p,
+            )
+        ]
         messages = [format_to_messages(pair) for pair in pairs]
-        print(f"{split}: {len(records)} conversations -> {len(messages)} turns")
+        print(f"{split}: {len(records)} conversations -> {len(messages)} turns (history noising: {noise})")
         write_jsonl(messages, args.output_dir / out_name, desc=f"Writing {out_name}")
 
 
