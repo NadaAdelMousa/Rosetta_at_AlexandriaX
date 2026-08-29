@@ -5,7 +5,7 @@ dataset) or test (from local private-test JSONL files) data, translating
 each conversation turn-by-turn with beam search.
 
 Each conversation is translated autoregressively over its own turns: turn
-N's prompt includes the model's own predictions for turns 1..N-1 as history
+N's prompt includes the model's OWN predictions for turns 1..N-1 as history
 (not the gold reference), because that's what the model actually has
 available at real inference time.
 
@@ -164,12 +164,16 @@ def format_history(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(record: dict, turn: dict, history: list[dict]) -> str:
+def build_prompt(record: dict, turn: dict, history: list[dict], fewshot_block: str = "") -> str:
     dialect = record.get("dialect") or "Arabic Dialect"
     domain = record.get("domain") or "Unknown Domain"
     participants = record.get("participants") or "Unknown Participants"
     direction = turn.get("direction") or "Unknown"
     speaker = turn.get("speaker") or "Unknown Speaker"
+
+    examples_section = (
+        f"### Here are some examples to help you:\n{fewshot_block}\n\n" if fewshot_block else ""
+    )
 
     return (
         f"Translate the English sentence into {dialect}.\n\n"
@@ -179,6 +183,7 @@ def build_prompt(record: dict, turn: dict, history: list[dict]) -> str:
         f"- Participants: {participants}\n"
         f"- Speaker: {speaker}\n"
         f"- Speaker Direction: {direction}\n\n"
+        f"{examples_section}"
         f"### Conversation History:\n"
         f"{format_history(history)}\n\n"
         f"### Sentence to Translate:\n"
@@ -338,6 +343,19 @@ def generate_translations(
     return [clean_generation(text) for text in decoded]
 
 
+def load_fewshot_lookup(path: Path | None) -> dict[tuple[str, int], str]:
+    """Load a models/embeddings.py --mode retrieve output file into a
+    (conv_id, turn_order) -> fewshot_examples_text lookup."""
+    if path is None:
+        return {}
+    lookup = {}
+    for record in read_jsonl(path):
+        key = (str(record.get("conv_id", "")).strip(), int(record.get("turn_order", 0)))
+        lookup[key] = record.get("fewshot_examples_text", "")
+    print(f"Loaded {len(lookup)} few-shot lookups from {path}")
+    return lookup
+
+
 def generate_prediction_records(
     records: list[dict],
     model,
@@ -346,12 +364,16 @@ def generate_prediction_records(
     max_new_tokens: int,
     num_beams: int,
     length_penalty: float,
+    fewshot_lookup: dict[tuple[str, int], str] | None = None,
     desc: str = "Generating predictions",
 ) -> list[dict]:
-    """Translate every conversation turn-by-turn, feeding each record's OWN
-    prior predictions back in as history (not gold references)."""
+    """Translate every conversation turn-by-turn, feeding each record's own
+    prior predictions back in as history (not gold references). If
+    fewshot_lookup is given, each turn's prompt is augmented with the
+    matching retrieved examples from models/embeddings.py."""
     from tqdm import tqdm
 
+    fewshot_lookup = fewshot_lookup or {}
     histories: dict[int, list[dict]] = defaultdict(list)
     outputs = [
         {"conv_id": record["conv_id"], "country": record["country"], "turns": []}
@@ -367,7 +389,8 @@ def generate_prediction_records(
                 if turn_position >= len(turns):
                     continue
                 turn = turns[turn_position]
-                prompt = build_prompt(record, turn, histories[record_index])
+                fewshot_block = fewshot_lookup.get((record["conv_id"], int(turn["turn_order"])), "")
+                prompt = build_prompt(record, turn, histories[record_index], fewshot_block)
                 messages = format_to_messages(prompt)
                 active.append((record_index, turn, messages))
 
@@ -443,6 +466,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--make-submission-zip", action="store_true")
     parser.add_argument("--submission-zip-path", type=Path, default=Path("submission.zip"))
 
+    parser.add_argument("--fewshot-examples-path", type=Path, default=None,
+                         help="Optional output of models/embeddings.py --mode retrieve. When given, each "
+                              "turn's prompt is augmented with its retrieved few-shot examples. Exploratory "
+                              "feature, not part of the official submission pipeline.")
+
     return parser.parse_args()
 
 
@@ -460,6 +488,8 @@ def main() -> None:
         records = load_test_records(args.test_data_dir, args.test_file_pattern, args.countries)
     print(f"Loaded {len(records)} conversations ({args.data_source}).")
 
+    fewshot_lookup = load_fewshot_lookup(args.fewshot_examples_path)
+
     checkpoint_dir = resolve_checkpoint_dir(args)
     model, tokenizer = load_model_and_tokenizer(checkpoint_dir, args.model_name, args.load_in_4bit)
 
@@ -469,6 +499,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         num_beams=args.num_beams,
         length_penalty=args.length_penalty,
+        fewshot_lookup=fewshot_lookup,
         desc=f"Generating {args.data_source} predictions",
     )
 
