@@ -2,12 +2,24 @@
 """
 infer.py — Run a fine-tuned NileChat-3B checkpoint over dev (from the HF
 dataset) or test (from local private-test JSONL files) data, translating
-each conversation turn-by-turn with beam search.
+each conversation turn-by-turn.
 
 Each conversation is translated autoregressively over its own turns: turn
-N's prompt includes the model's OWN predictions for turns 1..N-1 as history
+N's prompt includes the model's own predictions for turns 1..N-1 as history
 (not the gold reference), because that's what the model actually has
 available at real inference time.
+
+Decoding
+--------
+--decoding beam (default, the official submission's setting): standard
+    beam search (--num-beams, --length-penalty).
+--decoding mbr (exploratory trial, NOT part of the official submission):
+    Minimum Bayes Risk decoding — sample --mbr-num-candidates candidates
+    per turn (temperature/top-p sampling), de-duplicate them, then pick
+    the candidate with the highest average pairwise sentence-BLEU utility
+    against the rest of the pool. Much more expensive per turn (one
+    forward pass generating N sequences instead of one beam search), so
+    --batch-size usually needs to be far smaller than for beam search.
 
 Model loading
 -------------
@@ -28,10 +40,11 @@ submission zip is built from (for test).
 Requirements
 ------------
 pip install torch transformers peft bitsandbytes wandb datasets tqdm
+pip install sacrebleu sentencepiece   # only needed for --decoding mbr
 
 Usage
 -----
-# Dev, scoring against a local checkpoint
+# Dev, scoring against a local checkpoint, standard beam search
 python infer.py --data-source dev --checkpoint-dir outputs/finetune_alex \
     --output-path development_predictions.jsonl
 
@@ -40,11 +53,17 @@ python infer.py --data-source test \
     --wandb-artifact RosettaAtAlexandriaX/DialectalArabicMT/model-FullScaleFT-NCchat:v5 \
     --test-data-dir testdataalex \
     --output-path test_predictions.jsonl --make-submission-zip
+
+# Dev, MBR decoding trial
+python infer.py --data-source dev --checkpoint-dir outputs/finetune_alex \
+    --decoding mbr --mbr-num-candidates 20 --mbr-temperature 0.4 --mbr-top-p 0.95 \
+    --batch-size 4 --output-path development_predictions_mbr.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import zipfile
 from collections import defaultdict
@@ -299,7 +318,106 @@ def clean_generation(text: str) -> str:
     return text
 
 
-def generate_translations(
+# ---- MBR decoding (exploratory trial, not part of the official submission) ----
+
+_MBR_BLEU_METRIC = None
+
+
+def sentence_bleu_utility(hyp: str, ref: str) -> float:
+    """Sentence-level spBLEU as an MBR similarity/utility score (0-100)."""
+    global _MBR_BLEU_METRIC
+    if hyp.strip() == "" or ref.strip() == "":
+        return 0.0
+    if _MBR_BLEU_METRIC is None:
+        from sacrebleu.metrics import BLEU
+        _MBR_BLEU_METRIC = BLEU(tokenize="flores200", effective_order=True)
+    return round(_MBR_BLEU_METRIC.sentence_score(hyp, [ref]).score, 6)
+
+
+def mbr_select(candidates: list[str], utility_fn=sentence_bleu_utility) -> str:
+    """Pick the candidate maximizing expected utility against the rest of the pool."""
+    n = len(candidates)
+    if n == 1:
+        return candidates[0]
+
+    scores = [0.0] * n
+    for i, j in itertools.permutations(range(n), 2):
+        scores[i] += utility_fn(candidates[i], candidates[j])
+
+    avg_scores = [s / (n - 1) for s in scores]
+    best_idx = max(range(n), key=lambda i: avg_scores[i])
+    return candidates[best_idx]
+
+
+def generate_translations_mbr(
+    prompts: list,
+    model,
+    tokenizer,
+    max_new_tokens: int,
+    num_candidates: int,
+    temperature: float,
+    top_p: float,
+) -> list[str]:
+    """Sample num_candidates translations per prompt and MBR-select the best
+    one (highest average pairwise sentence-BLEU against the rest of its
+    own candidate pool). Much costlier than beam search: one generate()
+    call produces batch_size * num_candidates sequences."""
+    import torch
+
+    previous_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    inputs = tokenizer.apply_chat_template(
+        prompts, tokenize=True, add_generation_prompt=True,
+        padding=True, return_dict=True, return_tensors="pt",
+    ).to(model.device)
+
+    prompt_length = inputs["input_ids"].shape[1]
+    batch_size = inputs["input_ids"].shape[0]
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            do_sample=True,
+            num_beams=1,
+            temperature=temperature,
+            top_p=top_p,
+            num_return_sequences=num_candidates,
+        )
+
+    # Rows are grouped per-prompt: prompt0's candidates first, then prompt1's, etc.
+    decoded = [
+        clean_generation(tokenizer.decode(ids[prompt_length:], skip_special_tokens=True))
+        for ids in output_ids
+    ]
+
+    tokenizer.padding_side = previous_padding_side
+
+    translations = []
+    for i in range(batch_size):
+        start = i * num_candidates
+        candidate_group = decoded[start:start + num_candidates]
+
+        seen = set()
+        unique_candidates = []
+        for candidate in candidate_group:
+            if candidate not in seen:
+                seen.add(candidate)
+                unique_candidates.append(candidate)
+
+        translations.append(mbr_select(unique_candidates))
+
+    return translations
+
+
+def generate_translations_beam(
     prompts: list,
     model,
     tokenizer,
@@ -343,6 +461,25 @@ def generate_translations(
     return [clean_generation(text) for text in decoded]
 
 
+def generate_translations(
+    prompts: list,
+    model,
+    tokenizer,
+    decoding: str,
+    max_new_tokens: int,
+    num_beams: int,
+    length_penalty: float,
+    mbr_num_candidates: int,
+    mbr_temperature: float,
+    mbr_top_p: float,
+) -> list[str]:
+    if decoding == "mbr":
+        return generate_translations_mbr(
+            prompts, model, tokenizer, max_new_tokens, mbr_num_candidates, mbr_temperature, mbr_top_p
+        )
+    return generate_translations_beam(prompts, model, tokenizer, max_new_tokens, num_beams, length_penalty)
+
+
 def load_fewshot_lookup(path: Path | None) -> dict[tuple[str, int], str]:
     """Load a models/embeddings.py --mode retrieve output file into a
     (conv_id, turn_order) -> fewshot_examples_text lookup."""
@@ -364,10 +501,14 @@ def generate_prediction_records(
     max_new_tokens: int,
     num_beams: int,
     length_penalty: float,
+    decoding: str = "beam",
+    mbr_num_candidates: int = 20,
+    mbr_temperature: float = 0.4,
+    mbr_top_p: float = 0.95,
     fewshot_lookup: dict[tuple[str, int], str] | None = None,
     desc: str = "Generating predictions",
 ) -> list[dict]:
-    """Translate every conversation turn-by-turn, feeding each record's own
+    """Translate every conversation turn-by-turn, feeding each record's OWN
     prior predictions back in as history (not gold references). If
     fewshot_lookup is given, each turn's prompt is augmented with the
     matching retrieved examples from models/embeddings.py."""
@@ -397,7 +538,9 @@ def generate_prediction_records(
             for batch in chunks(active, batch_size):
                 prompts = [item[2] for item in batch]
                 translations = generate_translations(
-                    prompts, model, tokenizer, max_new_tokens, num_beams, length_penalty
+                    prompts, model, tokenizer, decoding,
+                    max_new_tokens, num_beams, length_penalty,
+                    mbr_num_candidates, mbr_temperature, mbr_top_p,
                 )
                 for (record_index, turn, _), translation in zip(batch, translations):
                     outputs[record_index]["turns"].append({
@@ -459,8 +602,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+
+    parser.add_argument("--decoding", choices=["beam", "mbr"], default="beam",
+                         help="'beam' is the official submission setting. 'mbr' is an exploratory trial "
+                              "(sample-and-select, not part of the official submission) — needs a much "
+                              "smaller --batch-size since it generates --mbr-num-candidates sequences per turn.")
     parser.add_argument("--num-beams", type=int, default=5)
     parser.add_argument("--length-penalty", type=float, default=0.7)
+
+    parser.add_argument("--mbr-num-candidates", type=int, default=20, help="Only used with --decoding mbr.")
+    parser.add_argument("--mbr-temperature", type=float, default=0.4, help="Only used with --decoding mbr.")
+    parser.add_argument("--mbr-top-p", type=float, default=0.95, help="Only used with --decoding mbr.")
 
     parser.add_argument("--output-path", type=Path, required=True, help="Where to write the predictions JSONL.")
     parser.add_argument("--make-submission-zip", action="store_true")
@@ -499,6 +651,10 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         num_beams=args.num_beams,
         length_penalty=args.length_penalty,
+        decoding=args.decoding,
+        mbr_num_candidates=args.mbr_num_candidates,
+        mbr_temperature=args.mbr_temperature,
+        mbr_top_p=args.mbr_top_p,
         fewshot_lookup=fewshot_lookup,
         desc=f"Generating {args.data_source} predictions",
     )
