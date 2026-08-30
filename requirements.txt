@@ -1,0 +1,29 @@
+# Core (used by most scripts)
+torch
+transformers
+datasets
+huggingface_hub
+tqdm
+pandas
+
+# Fine-tuning (models/train.py) — GPU required
+unsloth
+trl
+peft
+bitsandbytes
+wandb
+
+# Inference (models/infer.py) — subset of the fine-tuning deps, no unsloth/trl needed
+# (torch, transformers, peft, bitsandbytes, wandb, datasets, tqdm already listed above)
+
+# Evaluation (evaluation/score.py, and --decoding mbr in models/infer.py)
+sacrebleu
+sentencepiece
+
+# Data prep: MADAR/PADIC (data/preprocess_madar_padic.py) — unconstrained track only
+scikit-learn
+camel-tools
+gdown
+
+# Embeddings / few-shot retrieval (models/embeddings.py) — exploratory, not part of the official submission
+faiss-cpu
