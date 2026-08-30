@@ -6,7 +6,7 @@ Full system description, related work, and error analysis: see our paper, *"Rose
 
 ## Approach
 
-- Freeze [UBC-NLP/NileChat-3B](https://huggingface.co/UBC-NLP/NileChat-3B-Base) and attach a LoRA adapter (r=32, α=32, dropout=0) targeting the attention and MLP projections.
+- Freeze [UBC-NLP/NileChat-3B](https://huggingface.co/UBC-NLP/NileChat-3B) and attach a LoRA adapter (r=32, α=32, dropout=0) targeting the attention and MLP projections.
 - Structured system/user prompts condition generation on dialect, country, domain, participants, speaker, and gender direction, with prior turns supplied as dialogue history.
 - **Constrained track:** fine-tuned only on the official [Alexandria](https://huggingface.co/datasets/UBC-NLP/alexandria) training set.
 - **Unconstrained track:** additionally pretrained on MADAR and PADIC (mapped to country-level dialect labels, MSA translated to English via NLLB-200) before task fine-tuning.
@@ -65,17 +65,7 @@ Training and the Kaggle baseline notebook additionally need a GPU (developed and
 
 ## Citation
 
-```bibtex
-@inproceedings{rosetta-alexandriax-2026,
-  title     = {Rosetta at AlexandriaX-2026: LoRA-Adapted NileChat for Context-Aware Dialectal Arabic Dialogue Translation},
-  author    = {Esmaeil, Nada and Rena, Fathima and Subhash, Sibi and Elgendy, Osama and Naguib, Mina and Omar, Salma and Arif, Muhammad},
-  year      = {2026},
-  note      = {AlexandriaX-2026 Shared Task system description paper}
-}
-```
-
-(Update with the final venue/proceedings entry once published.)
 
 ## Acknowledgments
 
-Built for the [AlexandriaX-2026](https://alexandriax.dlnlp.ai/) shared task, organized by El Mekki, Elmadany, Magdy, Ezzini, El-Haj, Jarrar, Alyafeai, Ghanem, and Abdul-Mageed. Uses the [Alexandria dataset](https://huggingface.co/datasets/UBC-NLP/alexandria) and [NileChat-3B](https://huggingface.co/UBC-NLP/NileChat-3B-Base).
+Built for the [AlexandriaX-2026](https://alexandriax.dlnlp.ai/) shared task, organized by El Mekki, Elmadany, Magdy, Ezzini, El-Haj, Jarrar, Alyafeai, Ghanem, and Abdul-Mageed. Uses the [Alexandria dataset](https://huggingface.co/datasets/UBC-NLP/alexandria) and [NileChat-3B](https://huggingface.co/UBC-NLP/NileChat-3B).
